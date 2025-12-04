@@ -1,0 +1,331 @@
+!pip install pandas openpyxl
+!pip install torch torchvision torchaudio  # Aseguramos PyTorch
+!pip install transformers accelerate
+!pip install scikit-learn matplotlib
+# Instalar una versión estable y conocida
+!pip install protobuf==3.20.3
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import AutoModel, AutoTokenizer
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+
+# --- 2.1 CONFIGURACIÓN DE PARÁMETROS ---
+
+# Configuración del Dispositivo (GPU o CPU)
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    print(f"✅ GPU DETECTADA: {torch.cuda.get_device_name(0)}")
+else:
+    DEVICE = torch.device("cpu")
+    print("⚠️ GPU NO DETECTADA. Usando CPU (Será más lento).")
+
+# Rutas y Parámetros
+FILE_PATH = "/kaggle/input/test-data-for-word-sense-disambiguation/TEST DATA_D_2905_from_Udaya.xlsx"
+MODEL_NAME = 'distilbert-base-uncased' 
+EMBED_DIM = 768 
+MAX_TOTAL_SENSES = 0 # Se ajustará automáticamente
+
+BATCH_SIZE = 32
+LR = 5e-4
+NUM_EPOCHS_PHASE1 = 10      # FASE 1: Prioridad Estructural
+LAMBDA_DIR_PHASE1 = 0.9    
+NUM_EPOCHS_PHASE2 = 35     # FASE 2: Prioridad Semántica
+LAMBDA_DIR_PHASE2 = 0.3    
+
+
+# --- 2.2 CLASES DE ARQUITECTURA DIALÉCTICA ---
+
+class ContextualizationMLP(nn.Module):
+    """Calcula el Vector de Contradicción (V_contr)."""
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim * 2, dim) 
+        self.fc2 = nn.Linear(dim, dim)
+    def forward(self, F_c1, F_key):
+        x = torch.cat((F_c1, F_key), dim=-1)
+        x = F.relu(self.fc1(x))
+        V_contr = self.fc2(x)
+        return V_contr
+
+class DialecticalWSDModel(nn.Module):
+    """Modelo con Memoria Estructural (Keys)."""
+    def __init__(self, model_name, embed_dim, num_senses):
+        super().__init__()
+        # Mover el modelo al DEVICE inmediatamente
+        self.transformer = AutoModel.from_pretrained(model_name).to(DEVICE)
+        
+        # Congelar para entrenar solo el MME
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+            
+        self.sense_keys = nn.Embedding(num_senses, embed_dim)
+        nn.init.uniform_(self.sense_keys.weight.data, -0.05, 0.05)
+            
+        self.context_mlp = ContextualizationMLP(embed_dim)
+        self.classifier = nn.Linear(embed_dim, num_senses) 
+        
+        # Mover módulos del MME al DEVICE
+        self.sense_keys.to(DEVICE)
+        self.context_mlp.to(DEVICE)
+        self.classifier.to(DEVICE)
+            
+    def forward(self, input_ids, attention_mask, target_idx, targets=None):
+        # Mover inputs al DEVICE
+        input_ids, attention_mask, target_idx = [t.to(DEVICE) for t in [input_ids, attention_mask, target_idx]]
+
+        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state 
+        
+        # F_c1 (Tesis - vector de la palabra)
+        F_c1 = torch.gather(sequence_output, 1, target_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, sequence_output.size(-1))).squeeze(1)
+        # F_c2 (Síntesis - vector [CLS] del contexto)
+        F_c2 = sequence_output[:, 0, :] 
+        
+        # F_key (Antítesis)
+        if targets is not None:
+            F_key = self.sense_keys(targets.to(DEVICE))
+        else:
+            logits_pred = self.classifier(F_c2)
+            predicted_sense_ids = torch.argmax(logits_pred, dim=1)
+            F_key = self.sense_keys(predicted_sense_ids)
+            
+        V_contr = self.context_mlp(F_c1, F_key)
+        logits = self.classifier(F_c2)
+        return logits, F_c1, F_c2, V_contr
+
+class DialecticalLossWSD(nn.Module):
+    """Función de pérdida con control Causal (L_Dir)."""
+    def __init__(self, lambda_dir=0.5):
+        super().__init__()
+        self.lambda_dir = lambda_dir
+        self.cross_entropy = nn.CrossEntropyLoss()
+
+    def forward(self, pred_logits, target_classes, F_c1, F_c2, V_contr):
+        L_clas = self.cross_entropy(pred_logits, target_classes.long())
+        
+        # Lógica Dialéctica
+        V_real_change = F_c2 - F_c1
+        cos_sim = F.cosine_similarity(V_real_change, V_contr, dim=1).mean()
+        L_dir = 1.0 - cos_sim # Minimizar L_Dir maximiza la similitud
+        
+        L_total = (1 - self.lambda_dir) * L_clas + self.lambda_dir * L_dir
+        return L_total, L_clas, L_dir
+
+
+# --- 2.3 CARGA DE DATOS (CORRECCIÓN CLASES) ---
+
+def load_data(file_path, tokenizer, max_len=64):
+    global MAX_TOTAL_SENSES
+    df = pd.read_excel(file_path, engine='openpyxl')
+    df.columns = ['SN', 'Oracion_Contexto', 'Palabra_Polisemia']
+    
+    # 🌟 CORRECCIÓN CRUCIAL: Generar etiquetas semánticas únicas por palabra
+    df['correct_id'] = df.groupby('Palabra_Polisemia').ngroup()
+    MAX_TOTAL_SENSES = df['correct_id'].nunique()
+    print(f"🔢 Clases detectadas (Sentidos Únicos): {MAX_TOTAL_SENSES}")
+    
+    df.dropna(subset=['Oracion_Contexto', 'Palabra_Polisemia'], inplace=True)
+    
+    input_ids, masks, target_idxs, labels = [], [], [], []
+    
+    for _, row in df.iterrows():
+        try:
+            txt = str(row['Oracion_Contexto'])
+            word = str(row['Palabra_Polisemia']).lower()
+            label = row['correct_id']
+            
+            enc = tokenizer(txt, padding='max_length', truncation=True, max_length=max_len, return_tensors='pt')
+            w_ids = tokenizer.encode(word, add_special_tokens=False)
+            
+            if not w_ids: continue
+            
+            token_id = w_ids[0]
+            # Solo consideramos la primera aparición del token
+            idx = (enc['input_ids'][0] == token_id).nonzero(as_tuple=True)[0]
+            
+            if len(idx) > 0:
+                input_ids.append(enc['input_ids'][0])
+                masks.append(enc['attention_mask'][0])
+                target_idxs.append(idx[0])
+                labels.append(label)
+        except Exception:
+            continue
+            
+    print(f"✅ Muestras procesadas: {len(input_ids)}")
+    return TensorDataset(
+        torch.stack(input_ids), torch.stack(masks), 
+        torch.tensor(target_idxs), torch.tensor(labels)
+    ), df
+
+# --- 2.4 BUCLE DE ENTRENAMIENTO ---
+
+def train_phase(model, loader, epochs, lambda_d, phase_name):
+    criterion = DialecticalLossWSD(lambda_dir=lambda_d)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    
+    model.train()
+    print(f"\n🚀 {phase_name} (Lambda_Dir={lambda_d})")
+    
+    for epoch in range(1, epochs + 1):
+        ep_loss, ep_clas, ep_dir = 0, 0, 0
+        for batch in loader:
+            # 🌟 CORRECCIÓN AQUÍ: Mover TODOS los tensores del batch a la GPU (DEVICE)
+            ids, mask, t_idx, lbl = [b.to(DEVICE) for b in batch] 
+            
+            optimizer.zero_grad()
+            # Ahora el modelo recibe inputs en GPU y lbl ya está en GPU
+            logits, F_c1, F_c2, V_contr = model(ids, mask, t_idx, targets=lbl)
+            loss, l_c, l_d = criterion(logits, lbl, F_c1, F_c2, V_contr)
+            
+            loss.backward()
+            optimizer.step()
+            
+            ep_loss += loss.item()
+            ep_clas += l_c.item()
+            ep_dir += l_d.item()
+            
+        avg_loss = ep_loss / len(loader)
+        avg_clas = ep_clas / len(loader)
+        avg_dir = ep_dir / len(loader)
+        
+        print(f"Epoca {epoch:03d} | L_Total: {avg_loss:.4f} | L_Clas: {avg_clas:.4f} | L_Dir: {avg_dir:.4f}")
+        
+# --- 2.5 EJECUCIÓN PRINCIPAL ---
+
+if __name__ == "__main__":
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    dataset, df_raw = load_data(FILE_PATH, tokenizer)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    
+    # Inicialización del Modelo
+    model = DialecticalWSDModel(MODEL_NAME, EMBED_DIM, MAX_TOTAL_SENSES)
+    
+    # === FASE 1: PRE-ENTRENAMIENTO ESTRUCTURAL (Forma) ===
+    train_phase(model, loader, NUM_EPOCHS_PHASE1, LAMBDA_DIR_PHASE1, "FASE 1: CONVERGENCIA ESTRUCTURAL")
+    
+    # === FASE 2: VINCULACIÓN SEMÁNTICA (Materia) ===
+    # El modelo y las keys (con la estructura aprendida) continúan entrenando.
+    train_phase(model, loader, NUM_EPOCHS_PHASE2, LAMBDA_DIR_PHASE2, "FASE 2: VINCULACIÓN SEMÁNTICA")
+    
+    # === VISUALIZACIÓN FINAL ===
+    print("\n📊 Generando PCA de las Keys (Prueba de Organización)...")
+    keys = model.sense_keys.weight.detach().cpu().numpy()
+    
+    pca = PCA(n_components=2)
+    k_2d = pca.fit_transform(keys)
+    var = pca.explained_variance_ratio_
+    
+    plt.figure(figsize=(10, 8))
+    # Colorear por ID de clase para ver la separación
+    plt.scatter(k_2d[:, 0], k_2d[:, 1], alpha=0.6, c=np.arange(len(keys)), cmap='viridis', s=30)
+    plt.title(f"MME - Organización Semántica (Varianza Explicada: {sum(var)*100:.2f}%)")
+    plt.xlabel(f"PC1 ({var[0]*100:.1f}%)")
+    plt.ylabel(f"PC2 ({var[1]*100:.1f}%)")
+    plt.colorbar(label='ID de Clase Semántica')
+    plt.grid(True, alpha=0.3)
+    
+    plt.show()
+    
+    print("✅ Proceso de Entrenamiento y Evaluación Visual Completado.")
+
+
+
+
+
+import torch
+from transformers import AutoModel, AutoTokenizer
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+# ⚠️ Asegúrate de que las siguientes variables estén definidas de la ejecución anterior:
+# MAX_TOTAL_SENSES (287)
+# EMBED_DIM (768)
+# BATCH_SIZE (32)
+# LR (5e-4)
+# DEVICE (cuda:0)
+# loader (DataLoader del conjunto de datos)
+# keys_weights_final (Tensor con los pesos de las Keys de DistilBERT)
+
+# Nombre del nuevo modelo a probar para la transferencia
+NEW_MODEL_NAME = 'bert-base-uncased' 
+
+print(f"=========================================================")
+print(f"|  PRUEBA DE TRANSFERENCIA: DistilBERT Keys -> {NEW_MODEL_NAME}  |")
+print(f"=========================================================")
+
+# 1. Inicializar Nuevo Tokenizer y Modelo BERT
+# (Se usa la arquitectura DialecticalWSDModel de tu código para inyectar los pesos)
+transfer_model = DialecticalWSDModel(NEW_MODEL_NAME, EMBED_DIM, MAX_TOTAL_SENSES).to(DEVICE)
+
+# 2. INYECTAR LAS KEYS APRENDIDAS (El Metaconocimiento)
+# Si el dataset de prueba es nuevo y tiene un diferente número de sentidos, 
+# se requeriría una remapeo de índices, pero asumimos el mismo # de sentidos (287).
+keys_weights_final = model.sense_keys.weight.data.clone().cpu()
+print(f"➡️ Inyectando {keys_weights_final.shape} Keys (Metaconocimiento) aprendidas...")
+transfer_model.sense_keys.weight.data.copy_(keys_weights_final.to(DEVICE))
+
+# 3. CONGELAR el Transformer y las Keys, solo afinar el clasificador
+for param in transfer_model.parameters():
+    param.requires_grad = False
+    
+# Solo permitimos que el clasificador se adapte al estilo de las salidas de BERT
+transfer_model.classifier.weight.requires_grad = True
+transfer_model.classifier.bias.requires_grad = True
+
+transfer_model.sense_keys.weight.requires_grad = True
+
+
+# 4. Definir el nuevo bucle de afinamiento del Clasificador
+def fine_tune_classifier_transfer(model, loader, epochs):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    
+    
+    model.train()
+    print(f"\n⚡️ Afinando Clasificador de {NEW_MODEL_NAME} (Solo {epochs} Épocas)")
+    
+    for epoch in range(1, epochs + 1):
+        ep_loss, ep_acc = 0, 0
+        total_samples = 0
+        
+        for batch in loader:
+            ids, mask, t_idx, lbl = [b.to(DEVICE) for b in batch] 
+            
+            optimizer.zero_grad()
+            
+            # Obtener Logits, usando F_key generada por la predicción actual (targets=None)
+            logits, _, _, _ = model(ids, mask, t_idx, targets=None) 
+            
+            loss = criterion(logits, lbl)
+            loss.backward()
+            optimizer.step()
+            
+            ep_loss += loss.item()
+            preds = torch.argmax(logits, dim=1)
+            ep_acc += (preds == lbl).sum().item()
+            total_samples += lbl.size(0)
+            
+        avg_loss = ep_loss / len(loader)
+        avg_acc = ep_acc / total_samples
+        
+        print(f"Epoca {epoch:02d} | Pérdida (CE): {avg_loss:.4f} | Precisión: {avg_acc:.4f}")
+        
+    return avg_loss, avg_acc
+
+# 5. Ejecutar la afinación de transferencia
+# Usamos el DataLoader del conjunto de entrenamiento (o el de prueba si lo has cargado)
+loss_final, acc_final = fine_tune_classifier_transfer(transfer_model, loader, epochs=16)
+
+print(f"\n✔️ Prueba de Transferencia a BERT Completada (5 Épocas).")
+print(f"   Pérdida Final de Clasificación (CE): {loss_final:.4f}")
+print(f"   Precisión Final: {acc_final*100:.2f}%")
