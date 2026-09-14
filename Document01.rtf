@@ -1,0 +1,123 @@
+{\rtf1\ansi\ansicpg1252\deff0\nouicompat\deflang3082{\fonttbl{\f0\fnil\fcharset0 Calibri;}{\f1\fnil\fcharset1 Segoe UI Symbol;}{\f2\fnil\fcharset161 Calibri;}}
+{\*\generator Riched20 10.0.19041}\viewkind4\uc1 
+\pard\sa200\sl276\slmult1\f0\fs22\lang10 Proposal: Thermodynamic Intentional Steering & Dynamic Anisotropy Reduction in LLM Inference\par
+(Based on the 'Traductor de Vecindades' Framework)\par
+To: Google DeepMind / Gemini Core Inference TeamFrom: Research & Dynamic Control Systems LeadSubject: Zero-Weight Intention Steering and Low-Latency Latent Control via R = A - M \tab Decomposition and Entropy-Guided Feedback Loop1. \par
+Executive Summary\par
+Current production control in Large Language Models (LLMs) relies heavily on high-cost post-training (RLHF/DPO), rigid systemic prompt inflation, or asynchronous secondary guardrail classifiers.\par
+We propose a low-latency (O(1)) geometric steering module operating directly on mid-layer hidden states and output vocabulary projections. By conceptualizing the latent space as inter-translatable neighborhoods of meaning, we isolate semantic tension (R) from structural/grammatical mass (M). By modulating this injection via a token-level Shannon entropy (H(P_t)) feedback loop, the system achieves real-time directional steering without modifying model weights, inflating the prompt context window, or disrupting base grammar.\par
+2. Core Architectural Pillars[ Local Context Window (A_local) ] \f1\u9472?\u9472?\f0 > [ Structural Decomposition R = A - M ]\par
+                                                    \f1\u9474?\f0\par
+                                                    \f1\u9660?\f0\par
+                                     [ Z-score Channel Normalization ]\par
+                                                    \f1\u9474?\f0\par
+[ Output Logits (S_t) ] \f1\u9472?\u9472?\f0 > [ H(P_t) Entropy Loop ] \f1\u9472?\u9472?\f0 > [ Adaptive Bias (\f2\lang1032\'e3_t \f0\lang1033\'b7 \f2\lang1032\'c4E \f0\lang1033\'b7 W_head^T) ]\par
+Pillar I: Residual Energy Decomposition (R = A - M)\par
+Standard activation steering suffers from high semantic noise because raw hidden states (A) mix content with syntax and token-frequency biases. We isolate pure semantic tension R by subtracting the expected independence matrix M:M = \\frac\{F \\cdot C\}\{T\}Where F represents line sum (token intensity) and C represents column sum (channel mass). \par
+The residual matrix R = A - M strips away the structural/grammatical baseline, yielding a pure representation of contextual intention.\par
+Pillar II: Inter-Channel Z-Score Whitening (Anisotropy Neutralization)Transformer hidden states naturally suffer from representation degeneration (the "cone effect"). By applying an inter-channel normalization against a neutral corpus baseline (\\mu_d, \\sigma_d):E_w = \\frac\{E_\{\\text\{raw\}\} - \\mu_d\}\{\\sigma_d\}\par
+The system maps latent energy into an isotropic space, allowing robust cross-domain target matching and translation across distinct semantic neighborhoods.\par
+Pillar III: Closed-Loop Entropy Regulation (H(P_t) Homeostasis)\par
+Static injection of vector bias (\\alpha v) leads to syntactic collapse when the model needs to output deterministic tokens. Our system regulates steering intensity \\gamma_t dynamically via token-level Shannon entropy:\\gamma_t = \\gamma_\{\\text\{max\}\} \\cdot \\sigma\\left(\\frac\{H(P_t) - H_\{\\text\{target\}\}\}\{\\tau\}\\right)\par
+High Entropy (Uncertainty / Drift): \\gamma_t \\to \\gamma_\{\\text\{max\}\}, pushing the model back toward the target coseme.Low Entropy (Deterministic Syntactic Paths): \\gamma_t \\to 0, releasing control to allow natural token completion (e.g., punctuation, code syntax).\par
+3. Production Mitigations for Scale (Gemini 1.5 Compatibility)\par
+To ensure this framework functions safely in extreme-scale production environments (1M+ context windows and MoE routing):\par
+Mitigation A:  Sliding Window Constraint for Infinite ContextCalculating the total mass T across a 2M token context matrix would cause catastrophic HBM memory fragmentation during continuous batching.\par
+Solution: We truncate the evaluation of A to a sliding window of the last k tokens (e.g., k=1024).\par
+ A_\{\\text\{local\}\} \\in \\mathbb\{R\}^\{k \\times D\}.\par
+ Long-range context remains perfectly preserved in the static KV-cache, but semantic steering is calculated in O(1) memory space based on immediate neighborhood tension.\par
+Mitigation B: Unified Manifold Injection for Mixture of Experts (MoE)In an MoE architecture, hidden states mid-network are fragmented across different expert combinations, making a unified (\\mu_d, \\sigma_d) baseline impossible to calculate reliably per-token.\par
+Solution: The R = A - M sensor and the subsequent \\gamma modulation are applied exclusively at the final dense projection layer (pre-lm_head). At this bottleneck, all expert routing has concluded, and outputs have been summed back into a continuous, unified latent manifold, allowing stable geometric translation.\par
+4. High-Value Application Cases\par
+Zero-Prompt System Directives (TTFT Savings): Instead of feeding 1,500 tokens of system prompts to enforce tone, formatting,  or domain expertise, a pre-computed target tensor \\Delta E is projected onto W_\{\\text\{head\}\}^T  at request initialization. This drastically reduces Time-To-First-Token and KV-cache overhead.\par
+Long-Context Thematic Anchoring: Over 1-million token outputs, models naturally drift from their initial persona or analytical framework. The entropy loop acts as a thermodynamic anchor, gently nudging the model back to the desired semantic neighborhood whenever uncertainty spikes, without breaking factual retrieval.\par
+Dynamic Tone Morphing: Allows real-time translation of the output's neighborhood (e.g., smoothly transitioning from an academic tone to a pedagogical tone mid-generation) simply by shifting the target vector \\Delta E, without regenerating the context.\par
+5. TPU/JAX Implementation Vectorization (Kernel Fusion)To make this viable in Pathways / XLA:Pre-compilation: W_\{\\text\{head\}\}^T \\cdot \\Delta E is computed once during target registration, reducing token-level operation to a single jax.lax.addcmul.\par
+Zero CPU Synchronization: The entropy calculation and sigmoidal scaling execute entirely inside the XLA HLO graph.\par
+No Dynamic Branching: Activation utilizes pure probabilistic operations (e.g., jnp.where) to maintain a static execution graph during continuous batching.Appendix A: Mathematical Foundation of R = A - M DecompositionLet A \\in \\mathbb\{R\}_\{+\}^\{k \\times D\} be the non-negative activation matrix captured over the local window k. \par
+A is a superposition: A = M + R + \\epsilon.\par
+Where M \\in \\mathbb\{R\}^\{k \\times D\} is the structural baseline, R is pure semantic tension, and \\epsilon  is noise.\par
+We define total energy mass: T = \\mathbf\{1\}_k^T A \\mathbf\{1\}_D.\par
+Marginal vectors for token intensity (F \\in \\mathbb\{R\}^\{k \\times 1\}) and channel mass (C \\in \\mathbb\{R\}^\{1 \\times D\}): F = A \\mathbf\{1\}_D \\quad ; \\quad C = \\mathbf\{1\}_k^T A\par
+Under independence scaling, expected structural mass is a rank-1 outer product: M = \\frac\{F \\cdot C\}\{T\} = \\frac\{(A \\mathbf\{1\}_D)(\\mathbf\{1\}_k^T A)\}\{\\mathbf\{1\}_k^T A \\mathbf\{1\}_D\}\par
+Proof of Grammatical Bias Cancellation: Subtracting M from A yields R. \par
+Evaluating the row marginal sums of R: R \\mathbf\{1\}_D = A \\mathbf\{1\}_D - \\frac\{(A \\mathbf\{1\}_D)(\\mathbf\{1\}_k^T A \\mathbf\{1\}_D)\}\{\\mathbf\{1\}_k^T A \\mathbf\{1\}_D\} = F - \\frac\{F \\cdot T\}\{T\} = \\mathbf\{0\}_k\par
+Since R \\mathbf\{1\}_D = \\mathbf\{0\}_k and \\mathbf\{1\}_k^T R = \\mathbf\{0\}_D^T, the residual matrix R is strictly centered around zero marginal sum. High-frequency syntax tokens that generate large norms in A are projected into the nullspace of M, leaving R as a pure representation of inter-channel semantic coupling.Appendix B: High-Performance JAX/Flax Implementation (Sliding Window & MoE Safe)Pythonimport jax\par
+import jax.numpy as jnp\par
+from flax import linen as nn\par
+\par
+@jax.jit\par
+def extract_local_residual_energy(hidden_states: jnp.ndarray, window_size: int = 1024) -> jnp.ndarray:\par
+    """\par
+    Calculates R = A - M applying a sliding window for O(1) memory scaling.\par
+    hidden_states: [batch=1, seq_len, hidden_dim D]\par
+    Returns: [1, D] - mean energy of the residual tension.\par
+    """\par
+    # Sliding Window: Extract only the most recent 'window_size' tokens\par
+    seq_len = hidden_states.shape[1]\par
+    start_idx = jnp.maximum(0, seq_len - window_size)\par
+    A = jax.lax.dynamic_slice_in_dim(jnp.squeeze(hidden_states, axis=0), start_idx, window_size, axis=0)\par
+    \par
+    A_pos = A.astype(jnp.float32) - jnp.min(A) + 1e-8\par
+    \par
+    # Marginals F [k, 1] and C [1, D]\par
+    F_vec = jnp.sum(A_pos, axis=-1, keepdims=True)\par
+    C_vec = jnp.sum(A_pos, axis=-2, keepdims=True)\par
+    T_sum = jnp.sum(A_pos)\par
+    \par
+    # Independence Matrix M = (F * C) / T\par
+    M = jnp.matmul(F_vec, C_vec) / T_sum\par
+    R = A_pos - M\par
+    \par
+    return jnp.expand_dims(jnp.mean(R ** 2, axis=0), axis=0)\par
+\par
+\par
+@jax.jit\par
+def compiled_tpu_steering_kernel(\par
+    logits: jnp.ndarray,\par
+    vocab_bias: jnp.ndarray,\par
+    gamma_max: float = 7.0,\par
+    h_target: float = 3.8,\par
+    tau: float = 0.5\par
+) -> jnp.ndarray:\par
+    """\par
+    Fused logit modulation kernel. Entropy loop applied functionally.\par
+    """\par
+    last_logits = logits[:, -1, :]\par
+    \par
+    probs = jax.nn.softmax(last_logits, axis=-1)\par
+    log_probs = jax.nn.log_softmax(last_logits, axis=-1)\par
+    H_t = -jnp.sum(probs * log_probs, axis=-1) / 0.69314718 # Base 2 Shannon Entropy\par
+    \par
+    # Thermodynamic Homeostasis: Sigmoidal scaling\par
+    h_diff = (H_t - h_target) / tau\par
+    gamma_t = gamma_max * jax.nn.sigmoid(h_diff) \par
+    gamma_t = jnp.expand_dims(gamma_t, axis=-1)\par
+    \par
+    steered_last_logits = last_logits + (gamma_t * vocab_bias)\par
+    return logits.at[:, -1, :].set(steered_last_logits)\par
+\par
+\par
+class FinalLayerSteererModule(nn.Module):\par
+    """\par
+    MoE-Safe Hook Module: Placed at the final unified manifold projection.\par
+    """\par
+    gamma_max: float = 7.0\par
+    h_target: float = 3.8\par
+    tau: float = 0.5\par
+    window_size: int = 1024\par
+\par
+    @nn.compact\par
+    def __call__(self, final_unified_hidden: jnp.ndarray, logits: jnp.ndarray, vocab_bias: jnp.ndarray, is_active: bool = True):\par
+        # 1. Neighborhood translation analysis on recent context window\par
+        r_energy = extract_local_residual_energy(final_unified_hidden, self.window_size)\par
+        \par
+        # 2. XLA-safe conditional routing\par
+        steered_logits = compiled_tpu_steering_kernel(\par
+            logits, vocab_bias, self.gamma_max, self.h_target, self.tau\par
+        )\par
+        \par
+        out_logits = jnp.where(is_active, steered_logits, logits)\par
+        return r_energy, out_logits\lang10\par
+}
+ 
